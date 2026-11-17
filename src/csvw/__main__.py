@@ -149,9 +149,14 @@ def csvw2sqlite(args=None, test=False):
         (
             ['output'],
             {'help': 'Path for the generated SQLite database file.'}),
+        (
+            ['--exact-decimals'],
+            {'action': 'store_true', 'default': False,
+             'help': 'Store xs:decimal values as exact decimal text instead of REAL floats, '
+                     'so that comparisons, ordering, grouping and sums are exact.'}),
     )
     tg = TableGroup.from_file(args.url)
-    db = Database(tg, args.output)
+    db = Database(tg, args.output, exact_decimals=args.exact_decimals)
     db.write_from_tg(_force=True)
     return exit(0, test=test)  # pylint: disable=R1722
 

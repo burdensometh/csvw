@@ -2,6 +2,17 @@ Changelog
 =========
 
 
+Version 4.2.1 (in development)
+------------------------------
+
+- Added an optional exact decimal mode for SQLite storage: pass ``exact_decimals=True``
+  to ``csvw.db.Database`` (or ``--exact-decimals`` to ``csvw2sqlite``) to store
+  ``xs:decimal`` values as exact decimal text with numeric collation and an exact
+  ``csvw_decimal_sum`` aggregate, avoiding binary float loss and default Decimal
+  context truncation in storage, comparison, sorting, grouping, summation and CSV
+  re-export. Legacy ``REAL`` storage remains the default.
+
+
 Version 4.2.0
 -------------
 

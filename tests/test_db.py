@@ -60,6 +60,217 @@ def test_read_preserves_declared_scalar_types(tg, datatype, values):
     db._connection.close()
 
 
+def _decimal_tg():
+    return TableGroup.fromvalue({'tables': [{'url': 'data', 'tableSchema': {'columns': [
+        {'name': 'grp', 'datatype': 'string'},
+        {'name': 'amount', 'datatype': 'decimal'},
+        {'name': 'num', 'datatype': 'integer'},
+    ]}}]})
+
+
+def test_legacy_decimal_mode_keeps_real_storage(tg):
+    tg.tables[0].tableSchema.columns.append(
+        Column.fromvalue({'name': 'v', 'datatype': 'decimal'}))
+    db = Database(tg)
+    assert db.tdict['data'].columns[0].db_type.name == 'REAL'
+    db.write(data=[{'v': decimal.Decimal('0.1')}])
+    with db.connection() as conn:
+        assert conn.execute('SELECT typeof(v) FROM data').fetchone() == ('real',)
+    db._connection.close()
+
+
+def test_exact_decimals_stored_as_canonical_text():
+    tg = _decimal_tg()
+    db = Database(tg, exact_decimals=True)
+    col = db.tdict['data'].columns[1]
+    assert col.db_type.name == 'TEXT'
+    assert 'COLLATE csvw_decimal' in col.sql(db.translate)
+    # Non-decimal columns keep their ordinary storage type.
+    assert db.tdict['data'].columns[2].db_type.name == 'INTEGER'
+
+    values = [
+        decimal.Decimal('1.2300'), decimal.Decimal('-2.5'), decimal.Decimal('100'),
+        decimal.Decimal('0.001'), decimal.Decimal('9.99'), None, decimal.Decimal('1.23'),
+    ]
+    db.write(data=[{'grp': 'a', 'amount': v, 'num': i} for i, v in enumerate(values)])
+    with db.connection() as conn:
+        assert conn.execute(
+            "SELECT DISTINCT typeof(amount) FROM data WHERE amount IS NOT NULL").fetchall() \
+            == [('text',)]
+        # Trailing zeros are preserved verbatim and no float representation appears.
+        assert conn.execute(
+            "SELECT amount FROM data WHERE num = 0").fetchone() == ('1.2300',)
+    db._connection.close()
+
+
+def test_exact_decimals_order_by_numeric_value_not_text():
+    # A purely lexicographic ordering would place '100' before '9.99'; numeric must not.
+    tg = _decimal_tg()
+    db = Database(tg, exact_decimals=True)
+    db.write(data=[
+        {'grp': 'a', 'amount': decimal.Decimal(v), 'num': 1}
+        for v in ['100', '-2.5', '9.99', '0.001', '-100.0', '10.50']])
+    ordered = [r[0] for r in db.query('SELECT amount FROM data ORDER BY amount')]
+    assert ordered == ['-100.0', '-2.5', '0.001', '9.99', '10.50', '100']
+    descending = [r[0] for r in db.query('SELECT amount FROM data ORDER BY amount DESC')]
+    assert descending == list(reversed(ordered))
+    # Filtering compares numerically as well (text comparison would misjudge '100' vs '9.99').
+    assert [r[0] for r in db.query(
+        "SELECT amount FROM data WHERE amount > '9.99' ORDER BY amount")] == \
+        ['10.50', '100']
+    # A Decimal parameter is adapted to exact text rather than bound as float.
+    assert [r[0] for r in db.query(
+        'SELECT amount FROM data WHERE amount > ? ORDER BY amount',
+        [decimal.Decimal('9.99')])] == ['10.50', '100']
+    db._connection.close()
+
+
+def test_exact_decimals_grouping_and_distinct_are_numeric():
+    tg = _decimal_tg()
+    db = Database(tg, exact_decimals=True)
+    db.write(data=[
+        {'grp': 'a', 'amount': None if v is None else decimal.Decimal(v), 'num': 1}
+        for v in ['1.0', '1.00', '1', '2.50', '2.5', None]])
+    # Numerically equal representations group together; NULL stays its own group.
+    groups = db.query(
+        'SELECT amount, COUNT(*) FROM data GROUP BY amount ORDER BY amount')
+    assert groups == [(None, 1), ('1.0', 3), ('2.50', 2)]
+    assert [r[0] for r in db.query('SELECT DISTINCT amount FROM data ORDER BY amount')] == \
+        [None, '1.0', '2.50']
+    db._connection.close()
+
+
+def test_exact_decimal_sum_avoids_float_and_context_truncation():
+    tg = _decimal_tg()
+    # Each addend has 30 fractional digits; the exact sum cannot fit in the default
+    # 28-digit Decimal context nor in a binary float.
+    parts = [decimal.Decimal('0.123456789012345678901234567891') for _ in range(10)]
+    db = Database(tg, exact_decimals=True)
+    db.write(data=[{'grp': 'a', 'amount': v, 'num': 1} for v in parts] +
+                  [{'grp': 'b', 'amount': None, 'num': 1}])
+    total = decimal.Decimal(
+        db.query('SELECT csvw_decimal_sum(amount) FROM data')[0][0])
+    with decimal.localcontext(decimal.Context(prec=60)):
+        assert total == sum(parts, decimal.Decimal(0))
+    # Aggregate over an empty / all-NULL set returns SQL NULL, like SQLite's sum().
+    assert db.query(
+        "SELECT csvw_decimal_sum(amount) FROM data WHERE grp = 'b'")[0][0] is None
+    # Grouped summation stays exact and numeric.
+    grouped = db.query(
+        "SELECT grp, csvw_decimal_sum(amount) FROM data GROUP BY grp ORDER BY grp")
+    with decimal.localcontext(decimal.Context(prec=60)):
+        expected = format(sum(parts, decimal.Decimal(0)), 'f')
+    assert grouped[0] == ('a', expected)
+    assert grouped[1][0] == 'b' and grouped[1][1] is None
+    db._connection.close()
+
+
+def test_exact_decimals_support_negative_numbers_and_null(tg):
+    tg.tables[0].tableSchema.columns.append(
+        Column.fromvalue({'name': 'v', 'datatype': 'decimal'}))
+    db = Database(tg, exact_decimals=True)
+    values = [decimal.Decimal('-0.0001'), decimal.Decimal('-1000000.5'), None,
+              decimal.Decimal('0'), decimal.Decimal('+7.25')]
+    db.write(data=[{'v': v} for v in values])
+    assert [r['v'] for r in db.read()['data']] == values
+    assert db.query('SELECT min(v), max(v) FROM data')[0] == ('-1000000.5', '7.25')
+    # -0 and 0 compare equal under the numeric collation.
+    with db.connection() as conn:
+        conn.execute('DELETE FROM data')
+    db.write(data=[{'v': decimal.Decimal('0')}, {'v': decimal.Decimal('-0.0')}])
+    assert db.query(
+        "SELECT COUNT(*) FROM data WHERE v = '0'")[0][0] == 2
+    db._connection.close()
+
+
+def test_exact_decimals_round_trip_back_to_csv(tg, tmp_path):
+    import csv as _csv
+    import io
+    col = Column.fromvalue({'name': 'v', 'datatype': 'decimal'})
+    tg.tables[0].tableSchema.columns.append(col)
+    db = Database(tg, exact_decimals=True)
+    long_value = decimal.Decimal('100.0000000000000000000000000001')
+    db.write(data=[{'v': long_value}])
+    # The long decimal is stored verbatim and re-exported byte-for-byte, never passing
+    # through binary float (note: the csvw cell *parser* itself applies the default Decimal
+    # context precision when reading such strings, which is independent of DB storage).
+    csv_text = tg.tables[0].write(db.read()['data'], fname=None).decode('utf-8')
+    assert '100.0000000000000000000000000001' in csv_text
+
+    # Full read/write/read round-trip for values within the parser's Decimal context.
+    values = [decimal.Decimal('1.2300'), decimal.Decimal('-2.5'), None,
+              decimal.Decimal('0.0000000000000000000000000001')]
+    db2 = Database(tg, exact_decimals=True)
+    db2.write(data=[{'v': v} for v in values])
+    rows = db2.read()['data']
+    csv_text = tg.tables[0].write(rows, fname=None).decode('utf-8')
+    parsed = list(_csv.reader(io.StringIO(csv_text)))
+    assert parsed == [
+        ['v'], ['1.2300'], ['-2.5'], [''],
+        ['0.0000000000000000000000000001']]
+    reread = [col.read(line[0]) for line in parsed[1:]]
+    assert reread == values
+    db._connection.close()
+    db2._connection.close()
+
+
+def test_exact_decimals_reject_float_and_non_finite_input(tg):
+    tg.tables[0].tableSchema.columns.append(
+        Column.fromvalue({'name': 'v', 'datatype': 'decimal'}))
+    db = Database(tg, exact_decimals=True)
+    with pytest.raises(TypeError, match='float'):
+        db.write(data=[{'v': 1.5}])
+    with pytest.raises(ValueError, match='finite'):
+        db.write(data=[{'v': decimal.Decimal('NaN')}])
+    with pytest.raises(ValueError, match='finite'):
+        db.write(data=[{'v': decimal.Decimal('Infinity')}])
+    db._connection.close()
+
+
+def test_exact_decimals_accept_int_and_str_input(tg):
+    tg.tables[0].tableSchema.columns.append(
+        Column.fromvalue({'name': 'v', 'datatype': 'decimal'}))
+    db = Database(tg, exact_decimals=True)
+    db.write(data=[{'v': 5}, {'v': '007.50'}, {'v': None}])
+    with db.connection() as conn:
+        assert [r[0] for r in conn.execute('SELECT v FROM data')] == ['5', '7.50', None]
+    db._connection.close()
+
+
+def test_exact_decimal_check_constraints(tg):
+    tg.tables[0].tableSchema.columns.append(Column.fromvalue(
+        {'name': 'v', 'datatype': {'base': 'decimal', 'minimum': -90, 'maximum': 90}}))
+    db = Database(tg, exact_decimals=True)
+    db.write(data=[{'v': decimal.Decimal('-10.5')}, {'v': decimal.Decimal('90.00')}])
+    for bad in [decimal.Decimal('100'), decimal.Decimal('-90.001')]:
+        with pytest.raises(sqlite3.IntegrityError):
+            db.write(data=[{'v': bad}])
+    db._connection.close()
+
+
+def test_exact_decimals_persist_to_file_and_reread(tg, tmp_path):
+    tg.tables[0].tableSchema.columns.append(
+        Column.fromvalue({'name': 'v', 'datatype': 'decimal'}))
+    fname = tmp_path / 'exact.sqlite'
+    db = Database(tg, fname=fname, exact_decimals=True)
+    db.write(data=[{'v': decimal.Decimal('1.2345678901234567890123456789')}])
+
+    # A fresh Database on the same file re-registers collation and aggregate functions.
+    db2 = Database(tg, fname=fname, exact_decimals=True)
+    assert db2.read()['data'][0]['v'] == \
+        decimal.Decimal('1.2345678901234567890123456789')
+    assert db2.query('SELECT csvw_decimal_sum(v) FROM data')[0][0] == \
+        '1.2345678901234567890123456789'
+
+    # Without exact mode the file is still openable, but the text is read via the legacy
+    # REAL-based converter path only for Database(tg) instances; here we simply confirm the
+    # on-disk representation is plain text.
+    raw = sqlite3.connect(fname)
+    assert raw.execute('SELECT typeof(v), v FROM data').fetchone() == \
+        ('text', '1.2345678901234567890123456789')
+    raw.close()
+
+
 def test_list_valued(tg, translate):
     tg.tables[0].tableSchema.columns.append(Column.fromvalue({'separator': '#', 'name': 'v'}))
     db = Database(tg, translate=translate)

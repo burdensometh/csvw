@@ -24,6 +24,14 @@ SQLite support has the following limitations:
 
 - regex constraints on strings (as specified via a :class:`csvw.Datatype`'s format attribute) are
   not enforced by the database.
+
+By default `xs:decimal` columns are stored as SQLite `REAL` values, i.e. binary floating point
+numbers, which may lose low-order digits. Passing ``exact_decimals=True`` to :class:`Database`
+switches to an *exact decimal mode* instead: finite decimal values are stored verbatim as
+canonical decimal strings (`TEXT`) and a dedicated collation and aggregate functions make sure
+comparisons, sorting, grouping and summation operate on the numeric values rather than on the
+lexicographic order of the text representation. Neither binary floating point nor the precision
+of the default :class:`decimal.Decimal` context is involved.
 """
 import json
 from typing import Optional, Union, Protocol, Callable, Any
@@ -46,12 +54,91 @@ def identity(s):  # pylint: disable=C0116
     return s
 
 
+#: Name of the SQLite collation ordering exact-decimal text by numeric value.
+DECIMAL_COLLATION = 'csvw_decimal'
+
+#: Name of the SQLite aggregate summing exact-decimal text without float or context rounding.
+DECIMAL_SUM = 'csvw_decimal_sum'
+
+
+def decimal_to_text(v: decimal.Decimal) -> str:
+    """
+    Serialize a finite :class:`decimal.Decimal` to the canonical text form stored in the database.
+
+    Uses fixed-point notation (never scientific notation) and preserves significant trailing
+    zeros. Finite values only - `NaN` and infinities cannot be represented exactly in SQLite.
+    """
+    if not v.is_finite():
+        raise ValueError(
+            f'exact decimal mode only supports finite decimal values, got {v}')
+    return format(v, 'f')
+
+
+def decimal_from_text(v: str) -> decimal.Decimal:
+    """Parse an exact-decimal database value back into a :class:`decimal.Decimal`."""
+    return decimal.Decimal(v) if v is not None else None
+
+
+def _adapt_decimal(v) -> Optional[str]:
+    """Adapt a Python value for binding to an exact-decimal column, rejecting float input."""
+    if v is None:
+        return None
+    if isinstance(v, decimal.Decimal):
+        return decimal_to_text(v)
+    if isinstance(v, float):
+        # A float may already have lost digits; accepting it silently would defeat the
+        # purpose of exact decimal mode.
+        raise TypeError(
+            'cannot store float in an exact decimal column; pass a decimal.Decimal, int or str')
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, str):
+        # Validate and canonicalize via Decimal, bypassing the default context precision.
+        return decimal_to_text(decimal.Decimal(v))
+    return decimal_to_text(decimal.Decimal(v))
+
+
+def decimal_collation(a: str, b: str) -> int:
+    """SQLite collation comparing exact-decimal text by numeric value."""
+    da, db = decimal.Decimal(a), decimal.Decimal(b)
+    return (da > db) - (da < db)
+
+
+class DecimalSum:
+    """
+    SQLite aggregate summing exact-decimal text exactly.
+
+    The addends are accumulated and summed in a local :class:`decimal.Context` whose precision
+    is large enough to hold the result without rounding, so neither binary floating point nor
+    the 28-digit default context can truncate it. The sum of zero non-NULL values is SQL
+    `NULL`, mirroring SQLite's built-in `sum()`.
+    """
+    def __init__(self):
+        self.parts: list[decimal.Decimal] = []
+
+    def step(self, v) -> None:  # pylint: disable=C0116
+        if v is not None:
+            self.parts.append(decimal.Decimal(v))
+
+    def finalize(self) -> Optional[str]:  # pylint: disable=C0116
+        if not self.parts:
+            return None
+        # Context precision counts significant digits, which for a finite decimal is the number
+        # of digits in its coefficient. Each addition may carry at most one extra digit, so a
+        # margin of one per addend guarantees a fully exact result.
+        prec = max(len(d.as_tuple().digits) for d in self.parts) + len(self.parts)
+        with decimal.localcontext(decimal.Context(prec=prec)):
+            total = sum(self.parts, decimal.Decimal(0))
+        return decimal_to_text(total)
+
+
 @dataclasses.dataclass
 class DBType:
     """A DB datatype together with read/write converters."""
     name: str
     convert: Callable[[Any], Any] = identity
     read: Callable[[Any], Any] = identity
+    collation: Optional[str] = None
 
 
 TYPE_MAP = {
@@ -61,6 +148,10 @@ TYPE_MAP = {
     'decimal': DBType('REAL', optcast(float), optcast(decimal.Decimal)),
     'hexBinary': DBType('BLOB'),
 }
+
+#: DB type used for `xs:decimal` columns when exact decimal mode is enabled.
+EXACT_DECIMAL_TYPE = DBType(
+    'TEXT', _adapt_decimal, decimal_from_text, collation=DECIMAL_COLLATION)
 
 
 class SchemaTranslator(Protocol):  # pylint: disable=R0903,C0115
@@ -129,16 +220,20 @@ class ColSpec:
     db_type: DBType = None
     required: bool = False
     csvw: Datatype = None
+    exact_decimals: bool = False
 
     def __post_init__(self):
         self.csvw_type = self.csvw_type or 'string'
-        if self.csvw_type in TYPE_MAP:
+        if self.exact_decimals and self.csvw_type == 'decimal':
+            self.db_type = EXACT_DECIMAL_TYPE
+        elif self.csvw_type in TYPE_MAP:
             self.db_type = TYPE_MAP[self.csvw_type]
         else:
             self.db_type = DBType(
                 'TEXT', DATATYPES[self.csvw_type].to_string, DATATYPES[self.csvw_type].to_python)
         if self.separator and self.db_type != 'TEXT':
-            self.db_type = DBType('TEXT', self.db_type.convert, self.db_type.read)
+            self.db_type = DBType(
+                'TEXT', self.db_type.convert, self.db_type.read, collation=self.db_type.collation)
 
     def check(self, translate: ColumnTranslator) -> Optional[str]:
         """
@@ -156,16 +251,23 @@ class ColSpec:
                 'date': 'date',
                 'datetime': 'datetime',
             }.get(self.csvw_type)
+            # Exact decimals are stored as TEXT; quote the bounds so they are compared via the
+            # column's numeric collation instead of being parsed as floating point literals.
+            quote = "'" if self.db_type.collation == DECIMAL_COLLATION else ''
+
+            def lit(v):
+                return f'{quote}{v}{quote}'
+
             if c.minimum is not None:
                 if func:
                     constraints.append(f"{func}(`{cname}`) >= {func}('{c.minimum}')")
                 else:
-                    constraints.append(f'`{cname}` >= {c.minimum}')
+                    constraints.append(f'`{cname}` >= {lit(c.minimum)}')
             if c.maximum is not None:
                 if func:
                     constraints.append(f"{func}(`{cname}`) <= {func}('{c.maximum}')")
                 else:
-                    constraints.append(f'`{cname}` <= {c.maximum}')
+                    constraints.append(f'`{cname}` <= {lit(c.maximum)}')
         elif any(cc is not None for cc in [c.length, c.minLength, c.maxLength]):
             if c.length:
                 constraints.append(f'length(`{cname}`) = {c.length}')
@@ -180,7 +282,12 @@ class ColSpec:
         _check = self.check(translate)
         null_constraint = ' NOT NULL' if self.required else ''
         check_constraint = f' CHECK ({_check})' if _check else ''
-        return f'`{translate(self.name)}` {self.db_type.name}{null_constraint}{check_constraint}'
+        # List-valued columns are stored as concatenated text or JSON, where a numeric
+        # collation would be meaningless; only attach it to scalar exact-decimal columns.
+        collation = f' COLLATE {self.db_type.collation}' \
+            if self.db_type.collation and not self.separator else ''
+        return f'`{translate(self.name)}` {self.db_type.name}{collation}' \
+               f'{null_constraint}{check_constraint}'
 
 
 @dataclasses.dataclass
@@ -207,7 +314,8 @@ class TableSpec:
     @classmethod
     def from_table_metadata(cls,
                             table: csvw.Table,
-                            drop_self_referential_fks: Optional[bool] = True) -> 'TableSpec':
+                            drop_self_referential_fks: Optional[bool] = True,
+                            exact_decimals: Optional[bool] = False) -> 'TableSpec':
         """
         Create a `TableSpec` from the schema description of a `csvw.metadata.Table`.
 
@@ -215,6 +323,8 @@ class TableSpec:
         :param drop_self_referential_fks: Flag signaling whether to drop self-referential foreign \
         keys. This may be necessary, if the order of rows in a CSVW table does not guarantee \
         referential integrity when inserted in order (e.g. an eralier row refering to a later one).
+        :param exact_decimals: Flag signaling whether `xs:decimal` columns should be stored as \
+        exact decimal text rather than binary floating point.
         :return: `TableSpec` instance.
         """
         spec = cls(name=table.local_name, primary_key=table.tableSchema.primaryKey)
@@ -251,6 +361,7 @@ class TableSpec:
                     separator=c.inherit('separator'),
                     required=c.inherit('required'),
                     csvw=c.inherit('datatype'),
+                    exact_decimals=exact_decimals,
                 ))
         return spec
 
@@ -301,7 +412,8 @@ class TableSpec:
 
 
 def schema(tg: csvw.TableGroup,
-           drop_self_referential_fks: Optional[bool] = True) -> list[TableSpec]:
+           drop_self_referential_fks: Optional[bool] = True,
+           exact_decimals: Optional[bool] = False) -> list[TableSpec]:
     """
     Convert the table and column descriptions of a `TableGroup` into specifications for the
     DB schema.
@@ -310,12 +422,16 @@ def schema(tg: csvw.TableGroup,
     :param drop_self_referential_fks: Flag signaling whether to drop self-referential foreign \
     keys. This may be necessary, if the order of rows in a CSVW table does not guarantee \
     referential integrity when inserted in order (e.g. an eralier row refering to a later one).
+    :param exact_decimals: Flag signaling whether `xs:decimal` columns should be stored as exact \
+    decimal text rather than binary floating point.
     :return: A pair (tables, reference_tables).
     """
     tables = {}
     for table in tg.tabledict.values():
         t = TableSpec.from_table_metadata(
-            table, drop_self_referential_fks=drop_self_referential_fks)
+            table,
+            drop_self_referential_fks=drop_self_referential_fks,
+            exact_decimals=exact_decimals)
         tables[t.name] = t
         for at in t.many_to_many.values():
             tables[at.name] = at
@@ -348,6 +464,10 @@ class Database:
     :param translate: Schema object name translator.
     :param drop_self_referential_fks: Flag signaling whether to drop or enforce self-referential \
     foreign-key constraints.
+    :param exact_decimals: Flag signaling whether `xs:decimal` columns should be stored in exact \
+    decimal mode. When enabled (the default remains `False`, i.e. legacy `REAL` storage), finite \
+    decimal values are stored as canonical decimal text and compared, sorted, grouped and summed \
+    by numeric value, without going through binary floating point or the default Decimal context.
 
     .. warning::
 
@@ -364,9 +484,11 @@ class Database:
             fname: Optional[Union[pathlib.Path, str]] = None,
             translate: Optional[SchemaTranslator] = None,
             drop_self_referential_fks: Optional[bool] = True,
+            exact_decimals: Optional[bool] = False,
     ):
         self.translate = translate or Database.name_translator
         self.fname = pathlib.Path(fname) if fname else None
+        self.exact_decimals = exact_decimals
         self.init_schema(tg, drop_self_referential_fks=drop_self_referential_fks)
         self._connection = None  # For in-memory dbs we need to keep the connection!
 
@@ -374,7 +496,9 @@ class Database:
         """Inititialize the db schema, possibly ignoring self-referential foreign keys."""
         self.tg = tg
         self.tables = schema(
-            self.tg, drop_self_referential_fks=drop_self_referential_fks) if self.tg else []
+            self.tg,
+            drop_self_referential_fks=drop_self_referential_fks,
+            exact_decimals=self.exact_decimals) if self.tg else []
 
     @property
     def tdict(self) -> dict[str, TableSpec]:  # pylint: disable=C0116
@@ -396,10 +520,46 @@ class Database:
     def connection(self) -> Union[sqlite3.Connection, contextlib.closing]:
         """DB connection to be used as context manager."""
         if self.fname:
-            return contextlib.closing(sqlite3.connect(str(self.fname)))
+            conn = sqlite3.connect(str(self.fname))
+            self._init_exact_decimals(conn)
+            return contextlib.closing(conn)
         if not self._connection:
             self._connection = sqlite3.connect(':memory:')
+            self._init_exact_decimals(self._connection)
         return self._connection
+
+    def _init_exact_decimals(self, conn: sqlite3.Connection) -> None:
+        """
+        Register the collation and aggregate functions backing exact decimal mode.
+
+        SQLite collations and aggregates are per-connection, so this must run for every
+        connection we open. Registration is harmless when no exact-decimal columns exist.
+        """
+        if not self.exact_decimals:
+            return
+        conn.create_collation(DECIMAL_COLLATION, decimal_collation)
+        conn.create_aggregate(DECIMAL_SUM, 1, DecimalSum)
+
+    def query(self, sql: str, params: Sequence[Any] = ()) -> list[tuple]:
+        """
+        Execute an SQL statement against the database and return all fetched rows.
+
+        This is a convenience entry point for queries on exact-decimal columns: plain SQL
+        comparison, `ORDER BY` and `GROUP BY` use the column's numeric collation automatically,
+        and exact summation is available through the ``csvw_decimal_sum`` aggregate (the
+        built-in `sum()` would see text rather than numbers). :class:`decimal.Decimal`
+        parameters are adapted to canonical exact-decimal text before binding; in legacy mode
+        they are bound as floats, matching the `REAL` storage.
+
+        :param sql: SQL statement to execute.
+        :param params: Bind parameters, with `Decimal` values adapted as described.
+        :return: The fetched rows.
+        """
+        if self.exact_decimals:
+            params = tuple(_adapt_decimal(p) if isinstance(p, decimal.Decimal) else p
+                           for p in params)
+        with self.connection() as conn:
+            return list(conn.execute(sql, params))
 
     def _qt(self, tname: str, cname: Optional[str] = None) -> str:
         """Translate and then quote a db schema object."""
@@ -571,7 +731,9 @@ class TableReadSpec:
         # Assemble the conversion dictionary:
         for col in self.table.columns:
             if col.csvw_type in TYPE_MAP:
-                conv = TYPE_MAP[col.csvw_type].read
+                # Use the column's own read converter, which may be the exact-decimal parser
+                # rather than the default REAL-to-Decimal conversion.
+                conv = col.db_type.read
             else:
                 conv = DATATYPES[col.csvw_type].to_python
             self.converters[self.translate(self.name, col.name)] = (col.name, conv)

@@ -92,10 +92,31 @@ def test_csvw2datasette(tmp_path, mdname):
 
 def test_csvw2sqlite(tmp_path, mdname):
     out = tmp_path / 'db.sqlite'
-    run(csvw2sqlite, url=mdname, output=out)
+    run(csvw2sqlite, url=mdname, output=out, exact_decimals=False)
     assert out.exists()
     conn = sqlite3.connect(out)
     cu = conn.cursor()
     cu.execute('select count(*) from `csv.txt`')
     assert cu.fetchone()[0] == 2
     conn.close()
+
+
+def test_csvw2sqlite_exact_decimals(tmp_path):
+    md = tmp_path / 'md.json'
+    csvf = tmp_path / 'data.csv'
+    csvf.write_text('v\n1.2300\n-2.5\n', encoding='utf8')
+    md.write_text(json.dumps({
+        '@context': 'http://www.w3.org/ns/csvw',
+        'tables': [{
+            'url': 'data.csv',
+            'tableSchema': {'columns': [{'name': 'v', 'datatype': 'decimal'}]},
+        }],
+    }), encoding='utf8')
+    out = tmp_path / 'exact.sqlite'
+    run(csvw2sqlite, url=str(md), output=out, exact_decimals=True)
+    # The collation/aggregate functions are per-connection and registered by Database;
+    # a bare sqlite3 connection still sees the exact TEXT storage (never REAL).
+    conn = sqlite3.connect(out)
+    stored = conn.execute('SELECT typeof(v), v FROM `data.csv`').fetchall()
+    conn.close()
+    assert sorted(stored) == [('text', '-2.5'), ('text', '1.2300')]
