@@ -2,6 +2,18 @@ Changelog
 =========
 
 
+Unreleased
+----------
+
+- Add `csvw.merge` to merge rows that describe the same entity: explicit
+  old-key to canonical-key `KeyMap` mappings (chains allowed, cycles
+  rejected), type-aware resolution of scalar and composite keys, rewriting of
+  all declared scalar, composite and list-valued foreign keys (including
+  indirect references), conservative non-key attribute merging with batch
+  abort on conflicts, and in-memory primary/foreign-key validation of the
+  merged data.
+
+
 Version 4.2.0
 -------------
 

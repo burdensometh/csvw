@@ -10,6 +10,8 @@ from .dsv import (UnicodeWriter,
     UnicodeReader, UnicodeReaderWithLineNumber, UnicodeDictReader, NamedTupleReader,
     iterrows, rewrite)
 
+from .merge import MergeError, KeyMap, merge_tablegroup, check_referential_integrity
+
 __all__ = [
     'TableGroup',
     'Table', 'Column', 'ForeignKey',
@@ -20,6 +22,7 @@ __all__ = [
     'UnicodeReader', 'UnicodeReaderWithLineNumber', 'UnicodeDictReader', 'NamedTupleReader',
     'iterrows', 'rewrite',
     'CSVW',
+    'MergeError', 'KeyMap', 'merge_tablegroup', 'check_referential_integrity',
 ]
 
 __title__ = 'csvw'
