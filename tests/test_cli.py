@@ -7,7 +7,8 @@ import argparse
 import pytest
 
 from csvw.__main__ import (
-    csvw2json, csvw2datasette, csvwdescribe, csvwvalidate, csvw2markdown, csvw2sqlite)
+    csvw2json, csvw2datasette, csvwdescribe, csvwvalidate, csvw2markdown, csvw2sqlite,
+    csvwmerge)
 
 
 def relpath(fname):
@@ -98,4 +99,48 @@ def test_csvw2sqlite(tmp_path, mdname):
     cu = conn.cursor()
     cu.execute('select count(*) from `csv.txt`')
     assert cu.fetchone()[0] == 2
+    conn.close()
+
+
+def test_csvwmerge(tmp_path, capsys):
+    metadata = {
+        '@context': 'http://www.w3.org/ns/csvw',
+        'tables': [{
+            'url': 'master.csv',
+            'tableSchema': {
+                'primaryKey': ['id'],
+                'columns': [
+                    {'name': 'id'},
+                    {'name': 'name'},
+                    {'name': 'age', 'datatype': 'integer'},
+                ],
+            },
+        }],
+    }
+    md_path = tmp_path / 'metadata.json'
+    md_path.write_text(json.dumps(metadata), encoding='utf8')
+    (tmp_path / 'crm.csv').write_text('id,name,age\n1,Acme,\n', encoding='utf8')
+    (tmp_path / 'erp.csv').write_text('id,name,age\n1,Acme Inc.,12\n', encoding='utf8')
+    config = {
+        'metadata': str(md_path),
+        'workdir': str(tmp_path / 'out'),
+        'sources': [
+            {'name': 'crm', 'path': str(tmp_path / 'crm.csv'),
+             'priorities': {'name': 1, 'age': 2}},
+            {'name': 'erp', 'path': str(tmp_path / 'erp.csv'),
+             'priorities': {'name': 2, 'age': 1}},
+        ],
+    }
+    config_path = tmp_path / 'merge.json'
+    config_path.write_text(json.dumps(config), encoding='utf8')
+
+    assert run(csvwmerge, config=config_path, round='r1') == 0
+    out, _ = capsys.readouterr()
+    assert 'r1' in out
+    workdir = tmp_path / 'out'
+    assert (workdir / 'master.csv').exists()
+    assert (workdir / 'master.sqlite').exists()
+    conn = sqlite3.connect(workdir / 'master.sqlite')
+    row = conn.execute('SELECT `name`, `age` FROM `master.csv`').fetchone()
+    assert row == ('Acme', 12)
     conn.close()

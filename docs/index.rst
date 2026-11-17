@@ -20,6 +20,7 @@ Follow the links below for documentation of the csvw Python API.
    csvw
    datatypes
    db
+   merge
    frictionless
 
 

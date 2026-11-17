@@ -12,6 +12,7 @@ from termcolor import colored
 
 from csvw import CSVW, TableGroup
 from csvw.db import Database
+from csvw.merge import MasterMerger, Source
 from csvw.metadata_utils import metadata2markdown
 
 
@@ -153,6 +154,27 @@ def csvw2sqlite(args=None, test=False):
     tg = TableGroup.from_file(args.url)
     db = Database(tg, args.output)
     db.write_from_tg(_force=True)
+    return exit(0, test=test)  # pylint: disable=R1722
+
+
+def csvwmerge(args=None, test=False):
+    """Merge multiple sources into one CSVW master table by business key."""
+    args = parsed_args(
+        csvwmerge.__doc__,
+        args,
+        (['config'], {'help': 'Path to a JSON config file with "metadata", "workdir" and '
+                               '"sources" keys.'}),
+        (['--round'], {'default': None, 'help': 'Explicit identifier for the merge round.'}),
+    )
+    config = json.loads(pathlib.Path(args.config).read_text(encoding='utf8'))
+    tg = TableGroup.from_file(config['metadata'])
+    table = tg.tabledict[config['table']] if 'table' in config else tg.tables[0]
+    sources = [Source.fromdict(d) for d in config['sources']]
+    merger = MasterMerger(table, config['workdir'], sources, round_id=args.round)
+    result = merger.run()
+    print(colored(
+        f"merged round {result.round_id}: {len(result.master)} master rows, "
+        f"{len(result.provenance)} field provenance records", 'green'))
     return exit(0, test=test)  # pylint: disable=R1722
 
 

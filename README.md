@@ -153,6 +153,36 @@ $ csvwdescribe --delimiter "|" tests/fixtures/frictionless-data.csv
 
 Find the Python API documentation at [csvw.readthedocs.io](https://csvw.readthedocs.io/en/latest/).
 
+### Merging multiple sources into master data
+
+When several sources update fields of the same entities, `csvw.merge` rebuilds one
+CSVW master table from the **current snapshots** of the sources, keyed by a business
+key (the table's `primaryKey`). Each source declares per-field priorities (lower
+numbers win) and whether its null values may overwrite other sources
+(`null_overrides`); distinct non-null values at the same priority raise a
+`MergeConflict`. Because the complete snapshot of every source is persisted, deleting
+a record or withdrawing a field in one source restores the values the other sources
+still provide instead of keeping stale merged data.
+
+```python
+from csvw import Table
+from csvw.merge import MasterMerger, Source
+
+table = Table.from_file('entities-metadata.json')
+merger = MasterMerger(table, 'master-data', [
+    Source('crm', path='crm.csv', priorities={'name': 1, 'age': 2},
+           null_overrides=['name']),
+    Source('erp', path='erp.csv', priorities={'name': 2, 'age': 1, 'score': 1}),
+])
+result = merger.run()  # idempotent re-runs read the persisted snapshots again
+```
+
+Each run is an atomic **round**: `master.csv` (typed via the CSVW schema),
+`field-sources.csv` (per-field provenance, including the round id) and `master.sqlite`
+are staged together and only published after conflict checks and the SQLite load
+succeed, so a failure never leaves a half-finished update. The same merge can be
+driven from a JSON config with the `csvwmerge` command.
+
 A quick example for using `csvw` from Python code:
 
 ```python
