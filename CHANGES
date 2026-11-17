@@ -2,6 +2,17 @@ Changelog
 =========
 
 
+Version 4.2.1
+-------------
+
+- Added support for applying incremental changes to a SQLite database backing a `TableGroup`:
+  `csvw.db.Database.apply_changes` accepts batches of adds, corrections and deletions for
+  individual rows, tracked by per-row, increasing version numbers. Batches are applied
+  atomically, support forward references to rows created later in the same batch, update
+  list-valued associations together with their row and reject deleting rows which are still
+  referenced. A `csvwapplychanges` CLI command is provided as well.
+
+
 Version 4.2.0
 -------------
 

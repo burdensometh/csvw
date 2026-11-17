@@ -148,6 +148,30 @@ $ csvwdescribe --delimiter "|" tests/fixtures/frictionless-data.csv
 }
 ```
 
+### `csvwapplychanges`
+
+Apply a batch of incremental changes to a SQLite database created with `csvw2sqlite`:
+
+```shell
+$ csvwapplychanges tests/fixtures/multitable/metadata.json changes.json
+{"applied": 2, "skipped": 0, "deleted": 1}
+```
+
+`changes.json` holds a list of changes, each specifying the table, the primary key, an increasing
+version and the complete new values of the row - or `"delete": true`:
+
+```json
+[
+    {"table": "t1.csv", "key": "xyz", "version": 2,
+     "values": {"ID": "xyz", "_col.2": ["x", "y"], "int": 4,
+                "choice": "c", "regex": "44", "FK": "abc"}},
+    {"table": "t1.csv", "key": "111", "version": 1, "delete": true}
+]
+```
+
+Changes are applied atomically; stale versions are ignored, and re-using a version for different
+values is an error. See `csvw.db.Database.apply_changes` for details.
+
 
 ## Python API
 

@@ -9,6 +9,8 @@ from .metadata import (
 from .dsv import (UnicodeWriter,
     UnicodeReader, UnicodeReaderWithLineNumber, UnicodeDictReader, NamedTupleReader,
     iterrows, rewrite)
+from .db import (
+    Database, Change, ApplyResult, ChangeError, VersionConflict, ForeignKeyViolation)
 
 __all__ = [
     'TableGroup',
@@ -20,6 +22,7 @@ __all__ = [
     'UnicodeReader', 'UnicodeReaderWithLineNumber', 'UnicodeDictReader', 'NamedTupleReader',
     'iterrows', 'rewrite',
     'CSVW',
+    'Database', 'Change', 'ApplyResult', 'ChangeError', 'VersionConflict', 'ForeignKeyViolation',
 ]
 
 __title__ = 'csvw'

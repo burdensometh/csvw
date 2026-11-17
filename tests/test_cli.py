@@ -7,7 +7,8 @@ import argparse
 import pytest
 
 from csvw.__main__ import (
-    csvw2json, csvw2datasette, csvwdescribe, csvwvalidate, csvw2markdown, csvw2sqlite)
+    csvw2json, csvw2datasette, csvwdescribe, csvwvalidate, csvw2markdown, csvw2sqlite,
+    csvwapplychanges)
 
 
 def relpath(fname):
@@ -98,4 +99,29 @@ def test_csvw2sqlite(tmp_path, mdname):
     cu = conn.cursor()
     cu.execute('select count(*) from `csv.txt`')
     assert cu.fetchone()[0] == 2
+    conn.close()
+
+
+def test_csvwapplychanges(tmp_path, mdname, capsys):
+    out = tmp_path / 'db.sqlite'
+    run(csvw2sqlite, url=mdname, output=out)
+
+    changes = tmp_path / 'changes.json'
+    changes.write_text(json.dumps([
+        {'table': 'csv.txt', 'key': 'first', 'version': 1,
+         'values': {'ID': 'first', '_col.2': 'updated'}},
+    ]), encoding='utf8')
+    assert run(csvwapplychanges, url=mdname, db=out, changes=changes) == 0
+    assert json.loads(capsys.readouterr()[0]) == {'applied': 1, 'skipped': 0, 'deleted': 0}
+
+    changes.write_text(json.dumps([
+        {'table': 'csv.txt', 'key': 'first', 'version': 1,
+         'values': {'ID': 'first', '_col.2': 'updated'}},
+        {'table': 'csv.txt', 'key': 'sücond', 'version': 1, 'delete': True},
+    ]), encoding='utf8')
+    assert run(csvwapplychanges, url=mdname, db=out, changes=changes) == 0
+    assert json.loads(capsys.readouterr()[0]) == {'applied': 1, 'skipped': 1, 'deleted': 1}
+
+    conn = sqlite3.connect(out)
+    assert conn.execute('select * from `csv.txt`').fetchall() == [('first', 'updated')]
     conn.close()

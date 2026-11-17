@@ -20,12 +20,32 @@ Otherwise, the list of values is serialized as JSON.
 SQL table and column names can be customized by passing a translator callable when instantiating
 a :class:`Database`.
 
+**Incremental changes**
+
+A :class:`Database` can also receive incremental changes for existing data, rather than being
+rebuilt from scratch.  Changes are applied in batches via :meth:`Database.apply_changes`.  Each
+change specifies the table, the (possibly composite) primary key of the affected row, a
+monotonically increasing version and the complete new values of the row.  Omitting the values
+(or setting ``delete=True``) marks the row as deleted.
+
+Versions are tracked per table and key in an internal table, so applying a change is idempotent
+as long as the same version is not reused for different values.  Changes with a version older
+than the recorded one are ignored, and a repeated version with identical values is a no-op.  A
+batch is applied atomically: either all changes take effect, or neither the data nor the recorded
+version progress is modified.
+
+Within a batch, rows may refer to parent rows which are added later in the same batch.  Foreign
+key constraints are checked against the state at the end of the batch.  Consequently, deleting a
+parent row which is still referenced is rejected, while deleting a parent together with all
+referencing rows succeeds.
+
 SQLite support has the following limitations:
 
 - regex constraints on strings (as specified via a :class:`csvw.Datatype`'s format attribute) are
   not enforced by the database.
 """
 import json
+import datetime
 from typing import Optional, Union, Protocol, Callable, Any
 import decimal
 import pathlib
@@ -33,7 +53,7 @@ import sqlite3
 import functools
 import contextlib
 import collections
-from collections.abc import Sequence, Iterator
+from collections.abc import Sequence, Iterator, Iterable, Mapping
 import dataclasses
 
 import csvw
@@ -339,6 +359,144 @@ def schema(tg: csvw.TableGroup,
     return list(ordered.values())
 
 
+#: Name of the table in which incremental changes record their version progress.
+VERSIONS_TABLE = '_csvw_change_versions'
+
+
+class ChangeError(ValueError):
+    """Raised if a batch of incremental changes cannot be applied."""
+
+
+class VersionConflict(ChangeError):
+    """Raised if the same version is used for different values of the same row."""
+
+
+class ForeignKeyViolation(ChangeError, sqlite3.IntegrityError):
+    """Raised if the state resulting from a batch violates a declared foreign key."""
+
+
+_MISSING = object()
+
+
+def _jsonable(value):
+    """Turn a value into something which can be serialized as JSON deterministically."""
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, decimal.Decimal):
+        return str(value)
+    if isinstance(value, (datetime.date, datetime.time)):
+        return value.isoformat()
+    if isinstance(value, bytes):
+        return value.hex()
+    return repr(value)
+
+
+@dataclasses.dataclass
+class Change:
+    """
+    A single incremental change for one row of a CSVW table.
+
+    :ivar table: Name of the CSVW table (i.e. the table's `url`).
+    :ivar key: Primary key of the affected row. For single-column primary keys a scalar may be \
+    passed, for composite keys a sequence of values in the order of `primaryKey` is required.
+    :ivar version: Increasing version number of this change.
+    :ivar values: Complete new values for the row, as `dict` mapping CSVW column names to values. \
+    List-valued columns take lists. `None` (or `delete=True`) signals deletion of the row.
+    :ivar delete: Flag signaling deletion of the row.
+    """
+    table: str
+    key: Any
+    version: int
+    values: Optional[Mapping[str, Any]] = None
+    delete: bool = False
+
+    def __post_init__(self):
+        if isinstance(self.key, (list, tuple)):
+            self.key = tuple(self.key)
+        else:
+            self.key = (self.key,)
+        if self.values is None:
+            # Passing no values is interpreted as deletion, too.
+            self.delete = True
+        if self.delete and self.values is not None:
+            raise ChangeError('a change must not specify values and deletion at the same time')
+        if isinstance(self.version, bool) or not isinstance(self.version, int):
+            raise ChangeError('version must be an integer')
+        if not self.delete and not isinstance(self.values, Mapping):
+            raise ChangeError('values must be a mapping of column names to values')
+
+    @classmethod
+    def fromvalue(cls, value: Union['Change', Mapping[str, Any]]) -> 'Change':
+        """Create a `Change` from a `dict` or an object with corresponding attributes."""
+        if isinstance(value, cls):
+            return value
+
+        def get(*names):
+            for name in names:
+                if isinstance(value, Mapping) and name in value:
+                    return value[name]
+                if not isinstance(value, Mapping) and hasattr(value, name):
+                    return getattr(value, name)
+            return _MISSING
+
+        if not isinstance(value, Mapping) and not hasattr(value, 'version'):
+            raise ChangeError('invalid change specification')
+        table = get('table', 'table_name', 'tableName', 'resource')
+        key = get('key', 'pk', 'primary_key', 'primaryKey')
+        version = get('version')
+        values = get('values', 'row', 'data', 'new_values')
+        delete = get('delete', 'deleted', 'is_delete')
+        op = get('op', 'operation', 'action')
+        missing = [name for name, v in [('table', table), ('key', key), ('version', version)]
+                   if v is _MISSING or v is None]
+        if missing:
+            raise ChangeError('missing properties in change: {}'.format(', '.join(missing)))
+        if values is _MISSING:
+            values = None
+        if delete is _MISSING:
+            delete = False
+        if op is not _MISSING and op is not None:
+            if str(op).lower() in {'delete', 'deleted', 'remove'}:
+                delete = True
+            elif str(op).lower() not in {'insert', 'update', 'upsert', 'change', 'correction'}:
+                raise ChangeError(f'invalid operation in change: {op}')
+        if values is None and not delete:
+            raise ChangeError('a change must specify values, or be marked as deletion')
+        if values is not None and delete:
+            raise ChangeError('a change must not specify values and deletion at the same time')
+        return cls(
+            table=table,
+            key=key,
+            version=version,
+            values=None if delete else values,
+            delete=bool(delete),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class ApplyResult:
+    """Summary of the outcome of applying a batch of changes."""
+    applied: int = 0
+    skipped: int = 0
+    deleted: int = 0
+
+
+@dataclasses.dataclass
+class _PreparedChange:
+    """A change, validated against the database schema and converted for storage."""
+    table: str
+    key: tuple
+    key_json: str
+    version: int
+    payload: str
+    values: Optional[tuple] = None
+    associations: Optional[dict] = None
+
+    @property
+    def delete(self) -> bool:
+        return self.values is None
+
+
 class Database:
     """
     Represents a SQLite database associated with a :class:`csvw.TableGroup` instance.
@@ -375,6 +533,7 @@ class Database:
         self.tg = tg
         self.tables = schema(
             self.tg, drop_self_referential_fks=drop_self_referential_fks) if self.tg else []
+        self._drop_self_referential_fks = drop_self_referential_fks
 
     @property
     def tdict(self) -> dict[str, TableSpec]:  # pylint: disable=C0116
@@ -555,6 +714,346 @@ class Database:
                 insert(db, self.translate, atkey[0], atkey[1:], *rows)
 
             db.commit()
+
+    #
+    # Incremental changes
+    #
+    @staticmethod
+    def _versions_ddl() -> str:
+        return (
+            f"CREATE TABLE IF NOT EXISTS `{VERSIONS_TABLE}` ("
+            f"`table_name` TEXT NOT NULL, "
+            f"`key` TEXT NOT NULL, "
+            f"`version` INTEGER NOT NULL, "
+            f"`payload` TEXT NOT NULL, "
+            f"PRIMARY KEY(`table_name`, `key`))")
+
+    def ensure_schema(self, db: sqlite3.Connection):
+        """Create the schema for the tables of the associated `TableGroup` if it does not exist."""
+        for table in self.tables:
+            db.execute(table.sql(translate=self.translate))
+        db.execute(self._versions_ddl())
+
+    def _table_spec(self, name: str) -> TableSpec:
+        for table in self.tables:
+            if table.name == name or self.translate(table.name) == name:
+                return table
+        raise ChangeError(f'unknown table: {name}')
+
+    def _primary_key(self, spec: TableSpec) -> list[str]:
+        if not spec.primary_key:
+            raise ChangeError(f'table {spec.name} does not declare a primary key')
+        return list(spec.primary_key)
+
+    def _colspec(self, spec: TableSpec, name: str) -> ColSpec:
+        """Look up a column by CSVW name, falling back to its translated DB name."""
+        for col in spec.columns:
+            if col.name == name or self.translate(spec.name, col.name) == name:
+                return col
+        raise ChangeError(f'unknown column {name} in table {spec.name}')
+
+    @staticmethod
+    def _key_json(key: tuple) -> str:
+        return json.dumps([_jsonable(v) for v in key], ensure_ascii=False)
+
+    @staticmethod
+    def _convert_scalar(col: ColSpec, value):
+        if value is None:
+            return None
+        if col.csvw_type == 'integer' and isinstance(value, str):
+            try:
+                value = int(value)
+            except ValueError:
+                pass
+        elif col.csvw_type == 'string' and not isinstance(value, str):
+            # A TEXT column stores non-string values as strings, so we normalize keys accordingly
+            # to keep version tracking independent of how a key was passed in.
+            value = str(value)
+        return col.db_type.convert(value)
+
+    def _encode_row(self, spec: TableSpec, values: Mapping[str, Any]):
+        """Convert the values of a row for storage, returning scalar values and associations."""
+        m2m = {}
+        for colname in spec.many_to_many:
+            m2m[colname] = colname
+            m2m[self.translate(spec.name, colname)] = colname
+        scalar, associations = {}, {}
+        for key, value in values.items():
+            if key in m2m:
+                associations[m2m[key]] = list(value or [])
+                continue
+            col = self._colspec(spec, key)
+            if isinstance(value, list):
+                if col.csvw_type == 'string':
+                    value = (col.separator or ';').join(
+                        col.db_type.convert(vv) or '' for vv in value)
+                else:
+                    value = json.dumps([_jsonable(vv) for vv in value])
+            elif col.csvw_type == 'string' and value is not None and not isinstance(value, str):
+                value = str(value)
+            else:
+                value = self._convert_scalar(col, value)
+            scalar[col.name] = value
+        return scalar, associations
+
+    def _prepare(self, change: Change) -> _PreparedChange:
+        """Validate a change against the schema and convert it for storage."""
+        spec = self._table_spec(change.table)
+        pk = self._primary_key(spec)
+        if len(change.key) != len(pk):
+            raise ChangeError(
+                f'table {spec.name} requires a {len(pk)}-column primary key, '
+                f'got {len(change.key)} value(s)')
+        key = tuple(
+            self._convert_scalar(self._colspec(spec, name), value)
+            for name, value in zip(pk, change.key))
+        scalar = associations = None
+        if change.delete:
+            values = None
+            payload = json.dumps(None)
+        else:
+            scalar, associations = self._encode_row(spec, change.values)
+            missing = [c for c in pk if c not in scalar]
+            if missing:
+                raise ChangeError(
+                    f'values for table {spec.name} must include primary key column(s) '
+                    f'{", ".join(missing)}')
+            for name, value in zip(pk, key):
+                if scalar[name] != value:
+                    raise ChangeError(
+                        f'primary key value for {name} in values does not match key')
+            # Columns not present in `values` are set to NULL, list-valued columns omitted are
+            # reset to "no values" - a change carries the complete new state of the row.
+            values = tuple(scalar.get(c.name) for c in spec.columns)
+            # The payload captures the effective state of the row, so that re-applying the same
+            # version is recognized as duplicate even if columns were specified differently.
+            payload = json.dumps(
+                {'values': list(values),
+                 'associations': {c: list(associations.get(c, [])) for c in spec.many_to_many}},
+                sort_keys=True,
+                default=_jsonable)
+        return _PreparedChange(
+            table=spec.name,
+            key=key,
+            key_json=self._key_json(key),
+            version=change.version,
+            payload=payload,
+            values=values,
+            associations=associations,
+        )
+
+    def _select_versions(self, db: sqlite3.Connection) -> dict[tuple[str, str], tuple]:
+        if not db.execute(
+                "SELECT 1 FROM `sqlite_master` WHERE `type` = 'table' AND `name` = ?",
+                (VERSIONS_TABLE,)).fetchone():
+            return {}
+        return {
+            (t, k): (v, p) for t, k, v, p in db.execute(
+                f"SELECT `table_name`, `key`, `version`, `payload` FROM `{VERSIONS_TABLE}`")
+        }
+
+    def apply_changes(
+            self,
+            changes: Optional[Union['Change', Mapping[str, Any], Iterable[Any]]] = None,
+            *more: Any,
+    ) -> ApplyResult:
+        """
+        Apply a batch of incremental changes to the database.
+
+        Changes are applied atomically: Either all changes in the batch take effect, or the
+        database - including the recorded version progress - is left untouched.
+
+        Rows may refer to parent rows which are only created later in the same batch; declared
+        foreign keys are checked against the state at the end of the batch. Deleting a row which
+        is still referenced by another row is therefore rejected, while deleting a row together
+        with all rows referencing it succeeds.
+
+        Applying a change is idempotent: Changes with a version older than the recorded version
+        for the same table and key are ignored. Re-applying the same version with the same values
+        is a no-op, while re-using a version for different values raises
+        :class:`VersionConflict`.
+
+        :param changes: Iterable of :class:`Change` instances (or `dict` representations thereof). \
+        Alternatively, changes may be passed as individual positional arguments.
+        :return: An :class:`ApplyResult` summarizing the outcome.
+        :raises ChangeError: If the batch is malformed or violates the schema.
+        :raises VersionConflict: If the same version is used for different values of a row.
+        :raises ForeignKeyViolation: If the state at the end of the batch violates a foreign key.
+        """
+        if changes is None:
+            raw = []
+        elif isinstance(changes, (Change, Mapping)):
+            raw = [changes]
+        else:
+            raw = list(changes)
+        raw.extend(more)
+        prepared = [self._prepare(Change.fromvalue(c)) for c in raw]
+        if not prepared:
+            return ApplyResult()
+
+        with self.connection() as db:
+            previous_isolation = db.isolation_level
+            previous_fk = db.execute('PRAGMA foreign_keys').fetchone()[0]
+            db.isolation_level = None  # Take control of transactions.
+            try:
+                if db.in_transaction:
+                    db.commit()
+                # Foreign keys are checked against the final state of the batch, so that rows may
+                # reference parents created later in the same batch.
+                db.execute('PRAGMA foreign_keys = OFF')
+                db.execute('BEGIN IMMEDIATE')
+                try:
+                    result = self._apply_prepared(db, prepared)
+                    db.execute('COMMIT')
+                except BaseException:
+                    if db.in_transaction:
+                        db.execute('ROLLBACK')
+                    raise
+            finally:
+                if previous_fk:
+                    db.execute('PRAGMA foreign_keys = ON')
+                db.isolation_level = previous_isolation
+        return result
+
+    def apply_batch(self, changes=None, *more) -> ApplyResult:
+        """Alias for :meth:`apply_changes`."""
+        return self.apply_changes(changes, *more)
+
+    def _apply_prepared(
+            self, db: sqlite3.Connection, prepared: list[_PreparedChange]) -> ApplyResult:
+        self.ensure_schema(db)
+        versions = self._select_versions(db)
+        applied = skipped = deleted = 0
+        for change in prepared:
+            known = versions.get((change.table, change.key_json))
+            if known is not None:
+                known_version, known_payload = known
+                if change.version < known_version:
+                    skipped += 1
+                    continue
+                if change.version == known_version:
+                    if change.payload != known_payload:
+                        raise VersionConflict(
+                            f'version {change.version} for {change.table} {change.key} '
+                            f'already exists with different values')
+                    skipped += 1
+                    continue
+            self._apply_one(db, change)
+            db.execute(
+                f"INSERT INTO `{VERSIONS_TABLE}` (`table_name`, `key`, `version`, `payload`) "
+                f"VALUES (?, ?, ?, ?) ON CONFLICT(`table_name`, `key`) DO UPDATE SET "
+                f"`version` = excluded.`version`, `payload` = excluded.`payload`",
+                (change.table, change.key_json, change.version, change.payload))
+            versions[(change.table, change.key_json)] = (change.version, change.payload)
+            applied += 1
+            if change.delete:
+                deleted += 1
+        self._check_foreign_keys(db)
+        return ApplyResult(applied=applied, skipped=skipped, deleted=deleted)
+
+    def _apply_one(self, db: sqlite3.Connection, change: _PreparedChange):
+        spec = self._table_spec(change.table)
+        pk = self._primary_key(spec)
+        qtable = self._qt(spec.name)
+        where = ' AND '.join(f'{self._qt(spec.name, c)} = ?' for c in pk)
+        params = tuple(change.key)
+        if change.delete:
+            db.execute(f"DELETE FROM {qtable} WHERE {where}", params)
+        else:
+            assert change.values is not None
+            cols = [c.name for c in spec.columns]
+            qcols = quoted(*[self.translate(spec.name, c) for c in cols])
+            qvals = ','.join('?' for _ in cols)
+            # An upsert keeps the row in place, so references to it stay valid.
+            db.execute(
+                f"INSERT INTO {qtable} ({qcols}) VALUES ({qvals}) "
+                f"ON CONFLICT({quoted(*[self.translate(spec.name, c) for c in pk])}) "
+                f"DO UPDATE SET " + ', '.join(
+                    f'{self._qt(spec.name, c)} = excluded.{self._qt(spec.name, c)}'
+                    for c in cols),
+                tuple(change.values))
+        # Multi-valued relations are replaced together with the row: a change describes the
+        # complete new state of a row, so associations not mentioned are removed, too.
+        assoc_rows = collections.defaultdict(list)
+        if not change.delete:
+            for colname, values in (change.associations or {}).items():
+                at = spec.many_to_many[colname]
+                for value in values:
+                    fkey, ctx = self.association_table_context(spec.name, colname, value)
+                    assoc_rows[at.name].append(tuple([change.key[0]] + list((fkey, ctx))))
+        for atname in {at.name for at in spec.many_to_many.values()}:
+            at = self._table_spec(atname)
+            db.execute(
+                f"DELETE FROM {self._qt(at.name)} WHERE "
+                f"{self._qt(at.name, at.columns[0].name)} = ?",
+                (change.key[0],))
+            rows = assoc_rows.get(at.name)
+            if rows:
+                qcols = quoted(*[self.translate(at.name, c.name) for c in at.columns])
+                qvals = ','.join('?' for _ in at.columns)
+                db.executemany(f"INSERT INTO {self._qt(at.name)} ({qcols}) VALUES ({qvals})", rows)
+
+    def _check_foreign_keys(self, db: sqlite3.Connection):
+        # We validate all declared foreign keys explicitly - including self-referential ones,
+        # which may have been dropped from the SQL schema (see `drop_self_referential_fks`).
+        self._check_declared_foreign_keys(db)
+        try:
+            violations = db.execute('PRAGMA foreign_key_check').fetchall()
+        except sqlite3.OperationalError:
+            # `foreign_key_check` raises if referenced columns are not unique - a schema problem,
+            # which is not caused by the batch and thus not reported here.
+            return
+        if violations:
+            raise ForeignKeyViolation(
+                'foreign key violation(s): ' + ', '.join(
+                    f'{table} row {rowid} -> {parent}'
+                    for table, rowid, parent, _ in violations[:5]))
+
+    def _check_declared_foreign_keys(self, db: sqlite3.Connection):
+        if not self.tg:
+            return
+        for table in self.tg.tables:
+            spec = self.tdict.get(table.local_name)
+            if spec is None or not table.tableSchema:
+                continue
+            colnames = {c.name for c in spec.columns}
+            for fk in table.tableSchema.foreignKeys:
+                if not fk.reference or fk.reference.schemaReference or not fk.reference.resource:
+                    continue
+                target = self.tdict.get(fk.reference.resource.string)
+                src_cols = list(fk.columnReference or [])
+                tgt_cols = list(fk.reference.columnReference or [])
+                if target is None or not src_cols or len(src_cols) != len(tgt_cols):
+                    continue
+                if any(c in spec.many_to_many for c in src_cols):
+                    # Association tables are covered by `PRAGMA foreign_key_check`.
+                    continue
+                if any(c not in colnames for c in src_cols):
+                    continue
+                if any(c not in {tc.name for tc in target.columns} for c in tgt_cols):
+                    continue
+                src_ref = [f's.{self._qt(spec.name, c)}' for c in src_cols]
+                tgt_ref = [f't.{self._qt(target.name, c)}' for c in tgt_cols]
+                # Null values are allowed for foreign keys, like in SQLite.
+                non_null = ' AND '.join(f'{c} IS NOT NULL' for c in src_ref)
+                match = ' AND '.join(f'{t} = {s}' for t, s in zip(tgt_ref, src_ref))
+                sql = (
+                    f"SELECT 1 FROM {self._qt(spec.name)} s WHERE {non_null} "
+                    f"AND NOT EXISTS (SELECT 1 FROM {self._qt(target.name)} t WHERE {match}) "
+                    f"LIMIT 1")
+                if db.execute(sql).fetchone():
+                    raise ForeignKeyViolation(
+                        f'foreign key violation: {spec.name}.{",".join(src_cols)} references '
+                        f'missing row in {target.name}')
+
+    def read_versions(self) -> dict[tuple[str, tuple], int]:
+        """Get the recorded version for each changed row, keyed by (table name, primary key)."""
+        with self.connection() as db:
+            versions = self._select_versions(db)
+        return {
+            (table, tuple(json.loads(key))): version
+            for (table, key), (version, _) in versions.items()
+        }
 
 
 @dataclasses.dataclass

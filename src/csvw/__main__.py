@@ -156,6 +156,32 @@ def csvw2sqlite(args=None, test=False):
     return exit(0, test=test)  # pylint: disable=R1722
 
 
+def csvwapplychanges(args=None, test=False):
+    """Apply a batch of incremental changes to a SQLite database (created with csvw2sqlite)."""
+    args = parsed_args(
+        csvwapplychanges.__doc__,
+        args,
+        (
+            ['url'],
+            {'help': 'URL or local path to CSVW metadata file describing a TableGroup.'}),
+        (
+            ['db'],
+            {'help': 'Path to the SQLite database file.'}),
+        (
+            ['changes'],
+            {'help': 'Path to a JSON file with a list of changes. Each change is an object with '
+                     'properties `table`, `key`, `version` and either `values` (the complete new '
+                     'row) or `delete: true`.'}),
+    )
+    tg = TableGroup.from_file(args.url)
+    db = Database(tg, args.db)
+    changes = json.loads(pathlib.Path(args.changes).read_text(encoding='utf8'))
+    result = db.apply_changes(changes)
+    print(json.dumps(dict(
+        applied=result.applied, skipped=result.skipped, deleted=result.deleted)))
+    return exit(0, test=test)  # pylint: disable=R1722
+
+
 def csvw2markdown(args=None, test=False):
     """Create a Markdown document containing the CSVW metadata in human readable form."""
     args = parsed_args(

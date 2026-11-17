@@ -8,8 +8,9 @@ from datetime import date
 import pytest
 
 from csvw import TableGroup, Column, Table, ForeignKey
-from csvw.metadata import DATATYPES
-from csvw.db import Database
+from csvw.metadata import DATATYPES, Datatype
+from csvw.db import (
+    Database, Change, ApplyResult, ChangeError, VersionConflict, ForeignKeyViolation)
 
 FIXTURES = pathlib.Path(__file__).parent / 'fixtures'
 
@@ -471,3 +472,400 @@ def test_cyclic_table_group():
         }})
     with pytest.raises(ValueError, match='cyclic dependencies'):
         Database(TableGroup.fromvalue({'tables': tables}))
+
+
+#
+# Incremental changes
+#
+@pytest.fixture
+def change_tg():
+    """A TableGroup with a parent table, a child table and two list-valued foreign keys."""
+    return TableGroup.fromvalue({'tables': [
+        {'url': 'parent', 'tableSchema': {
+            'columns': [{'name': 'id'}, {'name': 'label'}],
+            'primaryKey': ['id'],
+        }},
+        {'url': 'child', 'tableSchema': {
+            'columns': [
+                {'name': 'id'},
+                {'name': 'pid'},
+                {'name': 'ref1', 'separator': ';'},
+                {'name': 'ref2', 'separator': ';'},
+            ],
+            'primaryKey': ['id'],
+            'foreignKeys': [
+                {
+                    'columnReference': ['pid'],
+                    'reference': {'resource': 'parent', 'columnReference': ['id']},
+                },
+                {
+                    'columnReference': ['ref1'],
+                    'reference': {'resource': 'parent', 'columnReference': ['id']},
+                },
+                {
+                    'columnReference': ['ref2'],
+                    'reference': {'resource': 'parent', 'columnReference': ['id']},
+                },
+            ],
+        }},
+    ]})
+
+
+def read_rows(db):
+    try:
+        rows = db.read()
+    except sqlite3.OperationalError:
+        # The db schema is only written when the first change is applied successfully.
+        return {}
+    res = {t: [] for t in db.tg.tabledict}
+    res.update({t: [dict(r) for r in values] for t, values in rows.items()})
+    return res
+
+
+def test_apply_changes_insert_update_delete(change_tg):
+    db = Database(change_tg)
+    res = db.apply_changes([
+        Change('parent', 'p1', 1, {'id': 'p1', 'label': 'one'}),
+        Change('parent', 'p2', 1, {'id': 'p2', 'label': 'two'}),
+    ])
+    assert res == ApplyResult(applied=2, skipped=0, deleted=0)
+    assert read_rows(db)['parent'] == [
+        {'id': 'p1', 'label': 'one'}, {'id': 'p2', 'label': 'two'}]
+
+    res = db.apply_changes(Change('parent', 'p1', 2, {'id': 'p1', 'label': 'ONE'}))
+    assert res.applied == 1
+    rows = {r['id']: r for r in read_rows(db)['parent']}
+    assert rows['p1']['label'] == 'ONE'
+
+    res = db.apply_changes(Change('parent', 'p2', 2, delete=True))
+    assert res.deleted == 1
+    assert [r['id'] for r in read_rows(db)['parent']] == ['p1']
+    db._connection.close()
+
+
+def test_apply_changes_older_and_duplicate_versions(change_tg):
+    db = Database(change_tg)
+    db.apply_changes([Change('parent', 'p1', 5, {'id': 'p1', 'label': 'current'})])
+    # An older version does not overwrite the current state:
+    assert db.apply_changes(
+        [Change('parent', 'p1', 4, {'id': 'p1', 'label': 'stale'})]).skipped == 1
+    # Repeating the same version with identical values is a no-op:
+    assert db.apply_changes(
+        [Change('parent', 'p1', 5, {'id': 'p1', 'label': 'current'})]).skipped == 1
+    assert read_rows(db)['parent'] == [{'id': 'p1', 'label': 'current'}]
+    # Repeating the same version with different values is an error:
+    with pytest.raises(VersionConflict):
+        db.apply_changes([Change('parent', 'p1', 5, {'id': 'p1', 'label': 'other'})])
+    assert read_rows(db)['parent'] == [{'id': 'p1', 'label': 'current'}]
+    db._connection.close()
+
+
+def test_apply_changes_same_version_in_batch(change_tg):
+    db = Database(change_tg)
+    with pytest.raises(VersionConflict):
+        db.apply_changes([
+            Change('parent', 'p1', 1, {'id': 'p1', 'label': 'one'}),
+            Change('parent', 'p1', 1, {'id': 'p1', 'label': 'two'}),
+        ])
+    assert read_rows(db).get('parent', []) == []
+    db._connection.close()
+
+
+def test_apply_changes_forward_reference_within_batch(change_tg):
+    db = Database(change_tg)
+    # The child row refers to a parent which is only created later in the same batch:
+    res = db.apply_changes([
+        Change('child', 'c1', 1, {'id': 'c1', 'pid': 'p1', 'ref1': ['p1', 'p2']}),
+        Change('parent', 'p1', 1, {'id': 'p1', 'label': 'one'}),
+        Change('parent', 'p2', 1, {'id': 'p2', 'label': 'two'}),
+    ])
+    assert res.applied == 3
+    rows = read_rows(db)
+    assert rows['child'] == [
+        {'id': 'c1', 'pid': 'p1', 'ref1': ['p1', 'p2'], 'ref2': []}]
+    db._connection.close()
+
+
+def test_apply_changes_missing_parent_rolls_back(change_tg):
+    db = Database(change_tg)
+    db.apply_changes([Change('parent', 'p1', 1, {'id': 'p1', 'label': 'one'})])
+    with pytest.raises(ForeignKeyViolation):
+        db.apply_changes([
+            Change('parent', 'p3', 1, {'id': 'p3', 'label': 'three'}),
+            # 'missing' is never created:
+            Change('child', 'c1', 1, {'id': 'c1', 'pid': 'missing'}),
+        ])
+    # Nothing from the failed batch is applied - neither data nor version progress:
+    assert read_rows(db)['parent'] == [{'id': 'p1', 'label': 'one'}]
+    assert db.read_versions() == {('parent', ('p1',)): 1}
+    db._connection.close()
+
+
+def test_apply_changes_delete_referenced_parent_rejected(change_tg):
+    db = Database(change_tg)
+    db.apply_changes([
+        Change('parent', 'p1', 1, {'id': 'p1', 'label': 'one'}),
+        Change('child', 'c1', 1, {'id': 'c1', 'pid': 'p1', 'ref1': ['p1']}),
+    ])
+    with pytest.raises(ForeignKeyViolation):
+        db.apply_changes([Change('parent', 'p1', 2, delete=True)])
+    assert read_rows(db)['parent'] == [{'id': 'p1', 'label': 'one'}]
+    assert db.read_versions()[('parent', ('p1',))] == 1
+
+    # Deleting parent and referencing child in the same batch succeeds:
+    res = db.apply_changes([
+        Change('child', 'c1', 2, delete=True),
+        Change('parent', 'p1', 3, delete=True),
+    ])
+    assert res.deleted == 2
+    assert read_rows(db)['parent'] == []
+    assert read_rows(db)['child'] == []
+    db._connection.close()
+
+
+def test_apply_changes_list_valued_references_updated_with_row(change_tg):
+    db = Database(change_tg)
+    db.apply_changes([
+        Change('parent', 'p1', 1, {'id': 'p1', 'label': 'one'}),
+        Change('parent', 'p2', 1, {'id': 'p2', 'label': 'two'}),
+        Change('parent', 'p3', 1, {'id': 'p3', 'label': 'three'}),
+        Change('child', 'c1', 1, {'id': 'c1', 'ref1': ['p1', 'p2'], 'ref2': ['p2']}),
+    ])
+    row = read_rows(db)['child'][0]
+    assert row['ref1'] == ['p1', 'p2']
+    assert row['ref2'] == ['p2']
+
+    # Updating the row replaces its multi-valued relations:
+    db.apply_changes(
+        Change('child', 'c1', 2, {'id': 'c1', 'ref1': ['p3'], 'ref2': []}))
+    row = read_rows(db)['child'][0]
+    assert row['ref1'] == ['p3']
+    assert row['ref2'] == []
+
+    # A list-valued reference to a missing parent is rejected:
+    with pytest.raises(ForeignKeyViolation):
+        db.apply_changes(
+            Change('child', 'c1', 3, {'id': 'c1', 'ref1': ['nope']}))
+    assert read_rows(db)['child'][0]['ref1'] == ['p3']
+    assert db.read_versions()[('child', ('c1',))] == 2
+    db._connection.close()
+
+
+def test_apply_changes_self_referential(change_tg):
+    tg = TableGroup.fromvalue({'tables': [
+        {'url': 'nodes', 'tableSchema': {
+            'columns': [{'name': 'id'}, {'name': 'parent'}],
+            'primaryKey': ['id'],
+            'foreignKeys': [{
+                'columnReference': ['parent'],
+                'reference': {'resource': 'nodes', 'columnReference': ['id']},
+            }],
+        }},
+    ]})
+    db = Database(tg)
+    # Within the batch, a row may refer to a parent created later:
+    db.apply_changes([
+        Change('nodes', 'b', 1, {'id': 'b', 'parent': 'a'}),
+        Change('nodes', 'a', 1, {'id': 'a', 'parent': None}),
+    ])
+    assert {r['id']: r['parent'] for r in read_rows(db)['nodes']} == {'a': None, 'b': 'a'}
+    # Deleting a referenced node is rejected, even if self-referential FKs are dropped from SQL:
+    with pytest.raises(ForeignKeyViolation):
+        db.apply_changes([Change('nodes', 'a', 2, delete=True)])
+    db._connection.close()
+
+
+def test_apply_changes_composite_primary_key():
+    tg = TableGroup.fromvalue({'tables': [
+        {'url': 't', 'tableSchema': {
+            'columns': [{'name': 'a'}, {'name': 'b'}, {'name': 'v'}],
+            'primaryKey': ['a', 'b'],
+        }},
+    ]})
+    db = Database(tg)
+    db.apply_changes([
+        Change('t', ('a1', 'b1'), 1, {'a': 'a1', 'b': 'b1', 'v': 'x'}),
+        Change('t', ['a1', 'b2'], 1, {'a': 'a1', 'b': 'b2', 'v': 'y'}),
+    ])
+    assert sorted((r['a'], r['b'], r['v']) for r in read_rows(db)['t']) == [
+        ('a1', 'b1', 'x'), ('a1', 'b2', 'y')]
+    # A key of the wrong arity is rejected:
+    with pytest.raises(ChangeError):
+        db.apply_changes([Change('t', 'a1', 2, {'a': 'a1', 'b': 'b1', 'v': 'z'})])
+    # Keys are converted according to the declared datatype:
+    with pytest.raises(ChangeError):
+        db.apply_changes([Change('t', ('a1', 'b1'), 2, {'a': 'a1', 'b': 'bX', 'v': 'z'})])
+    db._connection.close()
+
+
+def test_apply_changes_datatypes_and_translation(change_tg):
+    def translate(table, column=None):
+        return ('t_' + table) if column is None else ('c_' + column)
+
+    change_tg.tables[0].tableSchema.columns[0].datatype = Datatype.fromvalue('integer')
+    db = Database(change_tg, translate=translate)
+    db.apply_changes([
+        Change('parent', 1, 1, {'id': 1, 'label': 'one'}),
+        Change('child', 'c1', 1, {'id': 'c1', 'pid': 1, 'ref1': ['1']}),
+    ])
+    assert read_rows(db)['t_parent'] == [{'c_id': 1, 'c_label': 'one'}]
+    # Only the `parent.id` column is typed as integer; `child.pid` remains a string:
+    assert read_rows(db)['t_child'] == [
+        {'c_id': 'c1', 'c_pid': '1', 'c_ref1': ['1'], 'c_ref2': []}]
+    # Using translated names in change specs works as well:
+    db.apply_changes(Change('t_parent', 1, 2, {'c_id': 1, 'c_label': 'eins'}))
+    assert read_rows(db)['t_parent'] == [{'c_id': 1, 'c_label': 'eins'}]
+    db._connection.close()
+
+
+def test_apply_changes_dict_specs(change_tg):
+    db = Database(change_tg)
+    db.apply_changes([
+        {'table': 'parent', 'key': 'p1', 'version': 1, 'values': {'id': 'p1', 'label': 'one'}},
+        {'table_name': 'parent', 'pk': 'p2', 'version': 1,
+         'row': {'id': 'p2', 'label': 'two'}},
+    ])
+    assert len(read_rows(db)['parent']) == 2
+    db.apply_changes({'table': 'parent', 'key': 'p2', 'version': 2, 'delete': True})
+    assert [r['id'] for r in read_rows(db)['parent']] == ['p1']
+    # Malformed specs are rejected:
+    for spec in [
+        {'table': 'parent', 'version': 1, 'values': {'id': 'p3', 'label': 'x'}},
+        {'table': 'parent', 'key': 'p3', 'values': {'id': 'p3', 'label': 'x'}},
+        {'key': 'p3', 'version': 1, 'values': {'id': 'p3', 'label': 'x'}},
+        {'table': 'unknown', 'key': 'p3', 'version': 1, 'values': {'id': 'p3'}},
+        {'table': 'parent', 'key': 'p3', 'version': 1, 'values': {'id': 'p3', 'oops': 'x'}},
+        {'table': 'parent', 'key': 'p3', 'version': 1},
+    ]:
+        with pytest.raises(ChangeError):
+            db.apply_changes([spec])
+    db._connection.close()
+
+
+def test_apply_changes_initialise_schema(tmp_path, change_tg):
+    fname = tmp_path / 'db.sqlite'
+    db = Database(change_tg, fname=fname)
+    db.apply_changes([Change('parent', 'p1', 1, {'id': 'p1', 'label': 'one'})])
+    assert fname.exists()
+    # A new Database instance on the same file continues with the recorded versions:
+    db2 = Database(change_tg, fname=fname)
+    assert db2.apply_changes(
+        [Change('parent', 'p1', 1, {'id': 'p1', 'label': 'one'})]).skipped == 1
+    assert [r['label'] for r in read_rows(db2)['parent']] == ['one']
+
+
+def test_apply_changes_non_text_list_values():
+    tg = TableGroup.fromvalue({'tables': [
+        {'url': 't', 'tableSchema': {
+            'columns': [
+                {'name': 'id'},
+                {'name': 'ints', 'separator': ';', 'datatype': 'integer'},
+            ],
+            'primaryKey': ['id'],
+        }},
+    ]})
+    db = Database(tg)
+    db.apply_changes(Change('t', 'x', 1, {'id': 'x', 'ints': [1, 2, 3]}))
+    assert read_rows(db)['t'][0]['ints'] == [1, 2, 3]
+    db.apply_changes(Change('t', 'x', 2, {'id': 'x', 'ints': None}))
+    assert read_rows(db)['t'][0]['ints'] is None
+    db._connection.close()
+
+
+def test_apply_changes_custom_association_context(tg_with_foreign_keys):
+    class DatabaseWithCustomContext(Database):
+        def association_table_context(self, table, column, fkey):
+            # A custom context, but still distinguishing the two list-valued columns:
+            return fkey, f'ctx:{column}'
+
+        def select_many_to_many(self, db, table, context):
+            refs = Database.select_many_to_many(self, db, table, None)
+            return {
+                key: [(value, ctx) for value, ctx in values if ctx == f'ctx:{context}']
+                for key, values in refs.items()}
+
+    db = DatabaseWithCustomContext(tg_with_foreign_keys)
+    db.apply_changes([
+        Change('data', 'x', 1, {'v': 'x'}),
+        Change('data', 'y', 1, {'v': 'y'}),
+        Change('ref', '1', 1, {'pk': '1', 'ref1': ['y', 'x'], 'ref2': ['x']}),
+    ])
+    row = read_rows(db)['ref'][0]
+    assert row['ref1'] == [('y', 'ctx:ref1'), ('x', 'ctx:ref1')]
+    assert row['ref2'] == [('x', 'ctx:ref2')]
+    # Updating only `ref1` replaces only that column's associations:
+    db.apply_changes(Change('ref', '1', 2, {'pk': '1', 'ref1': ['x'], 'ref2': ['y']}))
+    row = read_rows(db)['ref'][0]
+    assert row['ref1'] == [('x', 'ctx:ref1')]
+    assert row['ref2'] == [('y', 'ctx:ref2')]
+    db._connection.close()
+
+
+def test_apply_changes_after_write(tg_with_foreign_keys):
+    db = Database(tg_with_foreign_keys)
+    db.write(ref=[{'pk': '1', 'ref1': ['x']}], data=[{'v': 'x'}, {'v': 'y'}])
+    # Existing data has no recorded version yet:
+    assert db.read_versions() == {}
+    db.apply_changes([
+        Change('ref', '1', 1, {'pk': '1', 'ref1': ['y'], 'ref2': []}),
+    ])
+    assert read_rows(db)['ref'][0]['ref1'] == ['y']
+    assert db.read_versions() == {('ref', ('1',)): 1}
+    db._connection.close()
+
+
+def test_apply_changes_empty_batch(change_tg):
+    db = Database(change_tg)
+    assert db.apply_changes([]) == ApplyResult()
+    assert db.apply_changes() == ApplyResult()
+    db.apply_changes(Change('parent', 'p1', 1, {'id': 'p1', 'label': 'one'}))
+    db._connection.close()
+
+
+@pytest.mark.parametrize('drop_self_referential_fks', [True, False])
+def test_apply_changes_self_referential_foreign_keys(drop_self_referential_fks):
+    tg = TableGroup.fromvalue({'tables': [
+        {'url': 'nodes', 'tableSchema': {
+            'columns': [{'name': 'id'}, {'name': 'parent'}],
+            'primaryKey': ['id'],
+            'foreignKeys': [{
+                'columnReference': ['parent'],
+                'reference': {'resource': 'nodes', 'columnReference': ['id']},
+            }],
+        }},
+    ]})
+    db = Database(tg, drop_self_referential_fks=drop_self_referential_fks)
+    db.apply_changes([
+        Change('nodes', 'b', 1, {'id': 'b', 'parent': 'a'}),
+        Change('nodes', 'a', 1, {'id': 'a', 'parent': None}),
+    ])
+    # Deleting a referenced node is rejected, regardless of the SQL schema:
+    with pytest.raises(ForeignKeyViolation):
+        db.apply_changes([Change('nodes', 'a', 2, delete=True)])
+    assert sorted(r['id'] for r in read_rows(db)['nodes']) == ['a', 'b']
+    db._connection.close()
+
+
+def test_apply_changes_composite_foreign_key():
+    tg = TableGroup.fromvalue({'tables': [
+        {'url': 'parent', 'tableSchema': {
+            'columns': [{'name': 'a'}, {'name': 'b'}], 'primaryKey': ['a', 'b']}},
+        {'url': 'child', 'tableSchema': {
+            'columns': [{'name': 'id'}, {'name': 'pa'}, {'name': 'pb'}],
+            'primaryKey': ['id'],
+            'foreignKeys': [{
+                'columnReference': ['pa', 'pb'],
+                'reference': {'resource': 'parent', 'columnReference': ['a', 'b']},
+            }],
+        }},
+    ]})
+    db = Database(tg)
+    db.apply_changes([
+        Change('child', 'c1', 1, {'id': 'c1', 'pa': 'x', 'pb': 'y'}),
+        Change('parent', ('x', 'y'), 1, {'a': 'x', 'b': 'y'}),
+    ])
+    with pytest.raises(ForeignKeyViolation):
+        db.apply_changes([Change('child', 'c1', 2, {'id': 'c1', 'pa': 'x', 'pb': 'z'})])
+    # A null-valued composite foreign key is allowed:
+    db.apply_changes([Change('child', 'c1', 2, {'id': 'c1', 'pa': None, 'pb': None})])
+    db._connection.close()
