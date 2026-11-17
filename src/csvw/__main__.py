@@ -10,9 +10,11 @@ import subprocess
 
 from termcolor import colored
 
-from csvw import CSVW, TableGroup
+from csvw import CSVW, TableGroup, Table
 from csvw.db import Database
+from csvw.migrate import rename_columns
 from csvw.metadata_utils import metadata2markdown
+from csvw.utils import get_json
 
 
 def parsed_args(desc, args, *argspecs):
@@ -153,6 +155,57 @@ def csvw2sqlite(args=None, test=False):
     tg = TableGroup.from_file(args.url)
     db = Database(tg, args.output)
     db.write_from_tg(_force=True)
+    return exit(0, test=test)  # pylint: disable=R1722
+
+
+def csvwrename(args=None, test=False):
+    """Rename columns in a CSVW dataset, updating CSV data files and metadata."""
+    args = parsed_args(
+        csvwrename.__doc__,
+        args,
+        (['url'], {'help': 'Path to a CSVW metadata file (JSON) describing a Table or '
+                           'TableGroup.'}),
+        (['-r', '--rename'], {'action': 'append', 'default': [], 'metavar': 'SPEC',
+                              'help': 'Column rename spec of the form "TABLE:OLD=NEW" (or '
+                                      '"OLD=NEW" for single-table metadata). May be used '
+                                      'multiple times.'}),
+        (['-n', '--dry-run'], {'action': 'store_true', 'default': False,
+                               'help': 'Only report what would be changed.'}),
+    )
+    data = get_json(args.url)
+    obj = TableGroup.from_file(args.url) if 'tables' in data else Table.from_file(args.url)
+    renames = {}
+    try:
+        for spec in args.rename:
+            tname, sep, pair = spec.partition(':')
+            if not sep:  # No table given: "OLD=NEW".
+                tname, pair = None, tname
+            old, sep, new = pair.partition('=')
+            if not sep or not old or not new:
+                raise ValueError(f'Invalid rename spec: {spec!r}')
+            if isinstance(obj, TableGroup):
+                if tname is None:
+                    raise ValueError(f'Rename spec must name a table: {spec!r}')
+                renames.setdefault(tname, {})[old] = new
+            else:
+                if tname not in [None, obj.local_name]:
+                    raise ValueError(f'Rename spec names unknown table: {spec!r}')
+                renames[old] = new
+        report = rename_columns(obj, renames, dry_run=args.dry_run)
+    except ValueError as e:
+        print(colored(str(e), 'red'))
+        return exit(2, test=test)
+    if report.dry_run:
+        print('Dry run - no files changed.')
+    for rename in report.renames:
+        print(f'{rename.table}: {rename.old} -> {rename.new}')
+    for ref in report.references:
+        print(f'  updated {ref}' if not report.dry_run else f'  would update {ref}')
+    for fname in report.csv_files:
+        print(f'rewrote {fname}' if not report.dry_run else f'would rewrite {fname}')
+    if report.metadata_file:
+        print(f'wrote {report.metadata_file}'
+              if not report.dry_run else f'would write {report.metadata_file}')
     return exit(0, test=test)  # pylint: disable=R1722
 
 

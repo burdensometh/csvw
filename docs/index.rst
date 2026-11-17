@@ -21,6 +21,7 @@ Follow the links below for documentation of the csvw Python API.
    datatypes
    db
    frictionless
+   migrate
 
 
 Indices and tables

@@ -78,6 +78,31 @@ $ csvwvalidate tests/fixtures/zipped-metadata.json
 OK
 ```
 
+### `csvwrename`
+
+Renaming columns in a CSVW dataset - in the metadata *and* the CSV data files.
+All renames of one batch are applied simultaneously (so swapping two columns'
+names works), and references to the renamed columns in `primaryKey`,
+`foreignKeys` (on both ends), `rowTitles` and URI templates are updated in sync.
+Column order, datatypes, dialects and all row values are preserved; name
+conflicts or dangling references are reported before anything is changed.
+
+```shell
+$ csvwrename path/to/metadata.json --rename 'children.csv:PARENT=parent_id' --rename 'parents.csv:ID=id'
+parents.csv: ID -> id
+children.csv: PARENT -> parent_id
+  updated parents.csv: primaryKey ['ID'] -> ['id']
+  updated children.csv: foreignKeys[0].columnReference ['PARENT'] -> ['parent_id']
+  updated children.csv: foreignKeys[0].reference.columnReference ['ID'] -> ['id'] (columns of parents.csv)
+rewrote path/to/parents.csv
+rewrote path/to/children.csv
+wrote path/to/metadata.json
+```
+
+Run with `--dry-run` to see what would change without modifying anything.
+The same functionality is available in the Python API as
+[`csvw.migrate.rename_columns`](https://csvw.readthedocs.io/en/latest/migrate.html).
+
 ### `csvwdescribe`
 
 Describing tabular-data files with CSVW metadata

@@ -2,6 +2,15 @@ Changelog
 =========
 
 
+Version 4.2.1
+-------------
+
+- Added explicit column-rename migrations: `csvw.migrate.rename_columns` (and the
+  `csvwrename` command) rename columns by identity - supporting swaps within one
+  batch - rewriting CSV header rows and metadata in sync, including `primaryKey`,
+  both ends of `foreignKeys`, `rowTitles` and column variables in URI templates.
+
+
 Version 4.2.0
 -------------
 
